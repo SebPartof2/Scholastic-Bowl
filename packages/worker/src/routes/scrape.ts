@@ -50,9 +50,6 @@ scrapeRoutes.post('/', async (c) => {
   }
 
   // Step 3: Scrape match results for each team
-  let gamesAdded = 0
-  let gamesSkipped = 0
-
   const allResults = await batchFetch(
     scrapedTeams,
     async (team: ScrapedTeam) => {
@@ -66,16 +63,27 @@ scrapeRoutes.post('/', async (c) => {
     200,
   )
 
+  // Step 4: Deduplicate in memory before inserting
+  // Normalize each game to a canonical key: sorted team IDs + scores
+  interface ResolvedGame {
+    teamAId: number
+    teamBId: number
+    scoreA: number
+    scoreB: number
+    isPostseason: boolean
+  }
+
+  const seen = new Set<string>()
+  const uniqueGames: ResolvedGame[] = []
+
   for (const { team, games } of allResults) {
     const teamDbId = teamMap.get(team.iesa_id)
     if (!teamDbId) continue
 
     for (const game of games) {
-      // Resolve opponent ID by name matching
       const oppName = game.opponent_name.toLowerCase().trim()
       let oppDbId = nameMap.get(oppName)
 
-      // Try fuzzy matching if exact match fails
       if (!oppDbId) {
         for (const [name, id] of nameMap) {
           if (name.includes(oppName) || oppName.includes(name)) {
@@ -85,36 +93,54 @@ scrapeRoutes.post('/', async (c) => {
         }
       }
 
-      if (!oppDbId) continue // Skip if we can't resolve the opponent
+      if (!oppDbId) continue
 
-      // Determine team_a (winner) and team_b (loser) for canonical storage
+      // Always store with the lower ID first for a canonical key
+      const id1 = Math.min(teamDbId, oppDbId)
+      const id2 = Math.max(teamDbId, oppDbId)
+      const s1 = teamDbId === id1 ? game.team_score : game.opponent_score
+      const s2 = teamDbId === id1 ? game.opponent_score : game.team_score
+      const key = `${id1}-${id2}-${s1}-${s2}`
+
+      if (seen.has(key)) continue
+      seen.add(key)
+
+      // Store with winner as team_a
       const teamAId = game.won ? teamDbId : oppDbId
       const teamBId = game.won ? oppDbId : teamDbId
       const scoreA = game.won ? game.team_score : game.opponent_score
       const scoreB = game.won ? game.opponent_score : game.team_score
 
-      // Deduplicate: check if this game already exists
-      const existing = await db.execute({
-        sql: `SELECT id FROM games
-              WHERE season_id = ? AND (
-                (team_a_id = ? AND team_b_id = ? AND score_a = ? AND score_b = ?)
-                OR (team_a_id = ? AND team_b_id = ? AND score_a = ? AND score_b = ?)
-              )`,
-        args: [seasonId, teamAId, teamBId, scoreA, scoreB, teamBId, teamAId, scoreB, scoreA],
-      })
-
-      if (existing.rows.length > 0) {
-        gamesSkipped++
-        continue
-      }
-
-      await db.execute({
-        sql: `INSERT INTO games (season_id, team_a_id, team_b_id, score_a, score_b, is_postseason)
-              VALUES (?, ?, ?, ?, ?, ?)`,
-        args: [seasonId, teamAId, teamBId, scoreA, scoreB, game.is_postseason ? 1 : 0],
-      })
-      gamesAdded++
+      uniqueGames.push({ teamAId, teamBId, scoreA, scoreB, isPostseason: game.is_postseason })
     }
+  }
+
+  // Step 5: Insert only unique games, checking DB for pre-existing ones
+  let gamesAdded = 0
+  let gamesSkipped = 0
+
+  for (const game of uniqueGames) {
+    const existing = await db.execute({
+      sql: `SELECT id FROM games
+            WHERE season_id = ? AND (
+              (team_a_id = ? AND team_b_id = ? AND score_a = ? AND score_b = ?)
+              OR (team_a_id = ? AND team_b_id = ? AND score_a = ? AND score_b = ?)
+            )`,
+      args: [seasonId, game.teamAId, game.teamBId, game.scoreA, game.scoreB,
+             game.teamBId, game.teamAId, game.scoreB, game.scoreA],
+    })
+
+    if (existing.rows.length > 0) {
+      gamesSkipped++
+      continue
+    }
+
+    await db.execute({
+      sql: `INSERT INTO games (season_id, team_a_id, team_b_id, score_a, score_b, is_postseason)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+      args: [seasonId, game.teamAId, game.teamBId, game.scoreA, game.scoreB, game.isPostseason ? 1 : 0],
+    })
+    gamesAdded++
   }
 
   // Step 4: Recalculate ratings
